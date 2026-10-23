@@ -17,19 +17,14 @@ Paperless-ngx ──(REST-API, nur lesend)──► sync ──► ChromaDB ◄�
 ## Voraussetzungen
 
 1. **Docker** mit Compose (z. B. über Portainer).
-2. **Ollama**, erreichbar aus den Containern, mit diesen Modellen:
-   ```bash
-   ollama pull llama3.2:1b
-   ollama pull nomic-embed-text-v2-moe
-   ollama pull dengcao/Qwen3-Reranker-0.6B:Q8_0
-   ```
-   Läuft Ollama selbst im Container: `docker exec <container> ollama pull <modell>`.
+2. **Ollama** ist Teil des Stacks. Beim ersten Start lädt der Dienst `ollama-init` die Modelle `llama3.2:1b`, `nomic-embed-text-v2-moe` und `dengcao/Qwen3-Reranker-0.6B:Q8_0` herunter (einige GB, das dauert). Fortschritt: `docker compose logs -f ollama-init`. Den Antworten-Chat kannst du erst nutzen, wenn dort „Alle Modelle geladen.“ steht.
+   Du hast schon einen Ollama? Dann setze `OLLAMA_BASE_URL` und lasse die Dienste `ollama` und `ollama-init` weg (siehe Kommentar in `compose.yaml`).
 3. **Paperless-ngx** mit API-Token. Lege am besten einen eigenen Benutzer an, der Dokumente nur *ansehen* darf (Paperless → Mein Profil → API-Token).
 
 ## Installation
 
 ```bash
-cp .env.example .env     # PAPERLESS_TOKEN, PAPERLESS_URL, OLLAMA_BASE_URL eintragen
+cp .env.example .env     # PAPERLESS_URL und PAPERLESS_TOKEN eintragen
 docker compose up -d --build
 ```
 
@@ -47,7 +42,7 @@ Die Oberfläche läuft danach auf Port **8501**. Der erste Abgleich startet auto
 | `PAPERLESS_TOKEN` | – | API-Token (Pflicht) |
 | `PAPERLESS_PUBLIC_URL` | `PAPERLESS_URL` | Adresse für die Links in den Quellen, falls du Paperless unter einem anderen Namen öffnest |
 | `SYNC_INTERVAL_MIN` | `30` | Minuten zwischen den Abgleichen |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama, aus Containern die Host-IP verwenden |
+| `OLLAMA_BASE_URL` | `http://ollama:11434` (Stack) bzw. `http://localhost:11434` (ohne Docker) | Ollama. Bei externem Ollama aus Containern die Host-IP verwenden |
 | `OLLAMA_MODEL` | `llama3.2:1b` | Antwortmodell |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text-v2-moe` | Embedding-Modell |
 | `OLLAMA_RERANK_MODEL` | `dengcao/Qwen3-Reranker-0.6B:Q8_0` | Reranker |

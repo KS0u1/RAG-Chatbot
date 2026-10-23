@@ -1,30 +1,79 @@
-# 💬 RAG-Chatbot
+# 💬 Paperless-Chat
 
-Ein KI-Assistent auf Basis von **Retrieval-Augmented Generation (RAG)**. Das System ermöglicht die Beantwortung von Fragen auf Basis von Dokumenten aus **Microsoft SharePoint** sowie lokalen Dateien.
+Ein lokaler KI-Assistent, mit dem du Fragen zu deinen **Paperless-ngx**-Dokumenten stellst (Rechnungen, Verträge, Bescheide, Briefe …). Alles läuft im eigenen Netz: Ollama für das Sprachmodell, ChromaDB als Vektordatenbank, Streamlit als Oberfläche. Es verlassen keine Daten das Homelab.
 
-## 🚀 Features
+## So funktioniert es
 
-* **LLM-Infrastruktur**: Betrieb über **Ollama** für die lokale Verarbeitung.
-* **Hybride Datenquellen**:
-    * **Lokal**: Einlesen von PDFs und Textdateien aus lokalen Verzeichnissen.
-    * **Cloud (Optional)**: Integration mit der Microsoft Graph API zum Einlesen von SharePoint-Dokumenten.
-* **Reranking**: Einsatz des `Qwen3-Reranker` Modells zur Gewichtung der Suchergebnisse vor der Antwortgenerierung.
-* **Multi-Format Support**: Extraktion von Texten aus **PDF, DOCX, TXT und Markdown**.
-* **Historie**: Speicherung der Chat-Verläufe mittels **SQLite** zur Bereitstellung von Kontext in laufenden Sitzungen.
+```
+Paperless-ngx ──(REST-API, nur lesend)──► sync ──► ChromaDB ◄── app (Streamlit) ──► Ollama
+   OCR-Text                          Chunks + Embeddings      Suche, Reranking, Antwort
+```
 
-## 🛠️ Technologie-Stack
+* **sync** gleicht Paperless alle `SYNC_INTERVAL_MIN` Minuten mit Chroma ab. Nur neue und geänderte Dokumente werden neu eingelesen, gelöschte werden entfernt. Verwendet wird der OCR-Text, den Paperless selbst liefert.
+* **app** sucht passende Textabschnitte (MMR), sortiert sie mit dem Reranker neu, übergibt sie an das Sprachmodell und hängt die verwendeten Dokumente als Links nach Paperless an die Antwort.
+* Jeder Textabschnitt trägt Titel, Absender, Dokumenttyp, Datum und Tags im Kopf. Dadurch findet die Suche auch Fragen wie „Stromrechnung 2025“.
+* Der Chatverlauf liegt in SQLite (Volume `app_data`).
 
-| Komponente | Technologie |
-| :--- | :--- |
-| **Orchestrierung** | LangChain & LangChain-Ollama |
-| **Vektordatenbank** | ChromaDB (HttpClient Anbindung) |
-| **LLM & Embeddings** | Ollama (Llama 3.2, Nomic-Embed-Text) |
-| **Web-Interface** | Streamlit |
-| **API-Schnittstelle** | Microsoft Graph API (O365) |
-| **Datenbank** | SQLAlchemy (SQLite) |
+## Voraussetzungen
 
-## 📋 Voraussetzungen
+1. **Docker** mit Compose (z. B. über Portainer).
+2. **Ollama**, erreichbar aus den Containern, mit diesen Modellen:
+   ```bash
+   ollama pull llama3.2:1b
+   ollama pull nomic-embed-text-v2-moe
+   ollama pull dengcao/Qwen3-Reranker-0.6B:Q8_0
+   ```
+   Läuft Ollama selbst im Container: `docker exec <container> ollama pull <modell>`.
+3. **Paperless-ngx** mit API-Token. Lege am besten einen eigenen Benutzer an, der Dokumente nur *ansehen* darf (Paperless → Mein Profil → API-Token).
 
-1.  **Ollama**: Erreichbarer Ollama-Server mit den Modellen `llama3.2`, `nomic-embed-text-v2-moe` und `dengcao/Qwen3-Reranker-0.6B:Q8_0`.
-2.  **Python**: Version 3.10 oder höher.
-3.  **ChromaDB**: Laufender ChromaDB-Server.
+## Installation
+
+```bash
+cp .env.example .env     # PAPERLESS_TOKEN, PAPERLESS_URL, OLLAMA_BASE_URL eintragen
+docker compose up -d --build
+```
+
+Die Oberfläche läuft danach auf Port **8501**. Der erste Abgleich startet automatisch mit dem Sync-Dienst (Fortschritt: `docker compose logs -f sync`) oder per Knopf in der Seitenleiste.
+
+**Portainer:** Stack aus dem Git-Repository anlegen (Compose-Pfad `compose.yaml`) und die Variablen aus `.env.example` unter *Environment variables* eintragen.
+
+**Nginx Proxy Manager:** Streamlit nutzt WebSockets. Aktiviere im Proxy-Host *Websockets Support*, sonst bleibt die Seite leer oder lädt ständig neu.
+
+## Konfiguration
+
+| Variable | Standard | Bedeutung |
+| :--- | :--- | :--- |
+| `PAPERLESS_URL` | – | Adresse von Paperless (Pflicht) |
+| `PAPERLESS_TOKEN` | – | API-Token (Pflicht) |
+| `PAPERLESS_PUBLIC_URL` | `PAPERLESS_URL` | Adresse für die Links in den Quellen, falls du Paperless unter einem anderen Namen öffnest |
+| `SYNC_INTERVAL_MIN` | `30` | Minuten zwischen den Abgleichen |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama, aus Containern die Host-IP verwenden |
+| `OLLAMA_MODEL` | `llama3.2:1b` | Antwortmodell |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text-v2-moe` | Embedding-Modell |
+| `OLLAMA_RERANK_MODEL` | `dengcao/Qwen3-Reranker-0.6B:Q8_0` | Reranker |
+| `RERANK_ENABLED` | `true` | `false` spart Zeit auf schwacher CPU |
+| `RERANK_TOP_N` / `RETRIEVER_K` / `RETRIEVER_FETCH_K` | `4` / `8` / `20` | Wie viele Abschnitte gesucht und verwendet werden |
+| `CHROMA_HOST` / `CHROMA_PORT` / `CHROMA_COLLECTION` | `localhost` / `8000` / `paperless` | ChromaDB (im Compose-Stack automatisch gesetzt) |
+| `SQLITE_URL` | `sqlite:///chat_history.db` | Chatverlauf (im Compose-Stack automatisch gesetzt) |
+
+## Betrieb
+
+* **Embedding-Modell wechseln:** Der Sync erkennt das und liest beim nächsten Lauf automatisch alle Dokumente neu ein.
+* **Alles neu einlesen:** Kästchen in der Seitenleiste oder `docker compose run --rm sync python -m infra.paperless_sync --full`.
+* **Einmaliger Abgleich per Kommando:** `python -m infra.paperless_sync`
+
+## Entwicklung
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest tests
+```
+
+Die Tests laufen ohne Ollama und ohne Chroma-Server (In-Memory-Chroma, nachgestellte Paperless-API).
+
+## Hinweise
+
+* **Platzbedarf:** Die Python-Pakete (vor allem ChromaDB und Streamlit) belegen rund 0,9 GB, das App-Image ist also etwa 1 GB groß (geschätzt, nicht gebaut). Dazu kommen das Chroma-Image und die Ollama-Modelle.
+* **Keine Anmeldung:** Die Oberfläche ist offen für jeden im Netz. Sie gibt Auskunft über *alle* Dokumente, die der Paperless-Benutzer sehen darf. Stelle sie nur im Heimnetz bereit oder setze eine Authentifizierung davor. ChromaDB ist bewusst nicht nach außen veröffentlicht.
+* **Quellen:** Angezeigt werden die Dokumente, aus denen der Kontext stammt, nicht zwingend nur die, die das Modell wörtlich verwendet hat.
+* **Qualität:** Mit `llama3.2:1b` sind Antworten schnell, aber bei komplexen Fragen ungenau. Ein größeres Modell verbessert das deutlich, braucht ohne GPU aber Geduld.

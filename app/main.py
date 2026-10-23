@@ -1,89 +1,88 @@
 import streamlit as st
 
-from langchain_community.chat_message_histories import SQLChatMessageHistory
-from datetime import datetime
-from sqlalchemy import text
-
 from core.chains import build_chain
+from infra.chroma_db import get_vector_store
 from infra.db import get_engine
+from infra.history import SQLiteChatHistory
+from infra.paperless import PaperlessError
+from infra.paperless_sync import SyncError, sync_paperless
 from infra.settings import settings
 
-from infra.chroma_db import (
-    upload_pdf_files,
-    upload_txt_files,
-    get_vector_store,
-    upload_sharepoint_library
-)
+USER_AVATAR = "👨🏽‍💻"
+ASSISTANT_AVATAR = "🥷🏾"
 
-r = build_chain()
+st.set_page_config(page_title="Paperless-Chat", page_icon="💬")
+
+
+@st.cache_resource
+def get_chain():
+    return build_chain()
+
+
+try:
+    chain = get_chain()
+except Exception as e:
+    st.error(f"Start fehlgeschlagen. Ist ChromaDB erreichbar ({settings.CHROMA_HOST}:{settings.CHROMA_PORT})?\n\n{e}")
+    st.stop()
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = "default"
 
-st.logo("./images/....", size="large")
-st.title("💬 RAG-Chatbot")
-st.caption("Dieser Chatbot soll dir dabei helfen, dich bei deinem Arbeitsalltag zu assistieren!")
+history = SQLiteChatHistory(st.session_state.session_id, get_engine())
 
-# "Neues Gespräch" Button
+st.title("💬 Paperless-Chat")
+st.caption("Stell Fragen zu deinen Dokumenten aus Paperless-ngx.")
+
 if st.button("Neues Gespräch"):
-    try:
-        SQLChatMessageHistory(
-            session_id=st.session_state.session_id,
-            connection=get_engine()
-        ).clear()
-        st.success("Chatverlauf gelöscht.")
-    except Exception as e:
-        st.warning(f"Verlauf konnte nicht gelöscht werden: {e}")
+    history.clear()
     st.rerun()
 
-# Nachrichten  aus DB laden mit created_at
-with get_engine().connect() as conn:
-    result = conn.execute(
-        text("SELECT message, created_at FROM message_store WHERE session_id = :sid ORDER BY id"),
-        {"sid": st.session_state.session_id}
-    ).fetchall()
+# Bisherigen Verlauf anzeigen
+for message, created_at in history.timestamped_messages():
+    role = "user" if message.type == "human" else "assistant"
+    with st.chat_message(role, avatar=USER_AVATAR if role == "user" else ASSISTANT_AVATAR):
+        st.markdown(message.content)
+        st.caption(created_at.strftime("%H:%M:%S"))
 
-user_avatar = "👨🏽‍💻"
-assistant_avatar = "🥷🏾"
-
-for row in result:
-    import json
-
-    msg = json.loads(row[0])
-    role = "user" if msg["type"] == "human" else "assistant"
-    avatar = user_avatar if role == "user" else assistant_avatar
-
-    with st.chat_message(role, avatar=avatar):
-        st.markdown(msg["data"]["content"])
-        if row[1]:  # created_at liegt als String vor
-            # String in datetime umwandeln
-            created_at_dt = datetime.fromisoformat(row[1])
-            st.caption(f"{created_at_dt.strftime('%H:%M:%S')}")
-
-
-# Chat-Eingabe
-if user := st.chat_input("Ich höre :D"):
-    with st.chat_message("user", avatar=user_avatar):
-        st.write(user)
-        st.caption(f"{datetime.now().strftime('%H:%M:%S')}")
-
-    with st.chat_message("assistant", avatar=assistant_avatar):
-        text = st.write_stream(
-            r.stream(
-                {"input": user},
+# Neue Frage
+if question := st.chat_input("Ich höre :D"):
+    with st.chat_message("user", avatar=USER_AVATAR):
+        st.write(question)
+    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+        st.write_stream(
+            chain.stream(
+                {"input": question},
                 config={"configurable": {"session_id": st.session_state.session_id}},
             )
         )
-        st.caption(f"{datetime.now().strftime('%H:%M:%S')}")
 
-# Sidebar für die Upload-Funktionen
+# Sidebar: Paperless-Abgleich
 with st.sidebar:
-    st.header("🗂️ Dokumente verwalten")
-    if st.button("📁 TXT-Dateien hochladen", type="primary"):
-        uploaded = upload_txt_files("./texts")  # Ordner mit Testdateien
-    if st.button("📄 PDF-Dateien hochladen", type="primary"):
-        uploaded_pdfs = upload_pdf_files("./pdfs")
-    if st.button("☁️ SharePoint-Dokumente laden", type="primary"):
-        st.write("Upload läuft… (bitte Tab offen lassen)")
-        count = upload_sharepoint_library(settings.SP_DRIVE_ID)
-        st.success(f"{count} SharePoint-Dokumente in Chroma geladen.")
+    st.header("🗂️ Dokumente")
+
+    try:
+        st.metric("Indexierte Textabschnitte", get_vector_store()._collection.count())
+    except Exception:
+        st.caption("Anzahl nicht abrufbar.")
+
+    if not settings.paperless_configured():
+        st.warning("PAPERLESS_URL und PAPERLESS_TOKEN sind nicht gesetzt.")
+    else:
+        st.caption(
+            f"Quelle: {settings.PAPERLESS_URL}. Der Sync-Dienst gleicht automatisch alle "
+            f"{settings.SYNC_INTERVAL_MIN} Minuten ab."
+        )
+        full = st.checkbox("Alles neu einlesen", help="Nötig nach Änderungen am Embedding-Modell oder bei Problemen.")
+        if st.button("Jetzt mit Paperless abgleichen", type="primary"):
+            bar = st.progress(0, text="Starte Abgleich …")
+
+            def on_progress(done: int, total: int, title: str):
+                bar.progress(done / total, text=f"{done}/{total}: {title}")
+
+            try:
+                result = sync_paperless(get_vector_store(), full=full, progress=on_progress)
+                bar.empty()
+                st.success(result.summary())
+            except (PaperlessError, SyncError) as e:
+                bar.empty()
+                st.error(str(e))

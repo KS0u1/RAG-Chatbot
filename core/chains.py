@@ -1,218 +1,173 @@
+import logging
 import re
-
 from datetime import datetime
+from functools import lru_cache
+
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import (
     ChatPromptTemplate,
-    SystemMessagePromptTemplate,
     HumanMessagePromptTemplate,
     MessagesPlaceholder,
+    SystemMessagePromptTemplate,
 )
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.runnables import RunnableLambda
-from langchain_core.documents import Document
-from langchain_community.chat_message_histories import SQLChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_ollama import OllamaLLM
 
-from .llm import get_llm
-from infra.db import get_engine
 from infra.chroma_db import get_vector_store
+from infra.db import get_engine
+from infra.history import SQLiteChatHistory
 from infra.settings import settings
 
-engine = get_engine()
+from .llm import get_llm
+
+log = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """Du bist ein persönlicher Dokumenten-Assistent. Du beantwortest Fragen zu den Dokumenten \
+des Nutzers aus seinem Paperless-System, zum Beispiel Rechnungen, Verträge, Bescheide, Briefe und Handbücher.
+AKTUELLES DATUM: {datum} (Nutze es für zeitbezogene Antworten wie "heute", "dieses Jahr" oder Fristen. \
+Nenne das Datum nur, wenn danach gefragt wird oder es für die Antwort nötig ist.)
+
+DEINE OBERSTE PRIORITÄT: KORREKTHEIT VOR SCHNELLIGKEIT.
+
+REGELN:
+1. Nutze für Fragen zu Dokumenten NUR den mitgelieferten Kontext. Erfinde keine Fakten und keine Quellen.
+2. Die Texte stammen aus Texterkennung (OCR). Ignoriere Erkennungsfehler, etwa "8 4" statt "§ 4" oder \
+"Diestwagen" statt "Dienstwagen", und versuche den Sinn zu verstehen.
+3. Nenne Beträge, Daten, Fristen und Nummern genau so, wie sie im Dokument stehen, mit Währung und Einheit.
+4. Passen mehrere Dokumente zur Frage (z. B. Rechnungen aus verschiedenen Monaten), nenne sie getrennt \
+mit Datum und Absender, statt sie zu vermischen.
+5. Nennt das Dokument eine andere Einheit oder einen anderen Zeitraum als die Frage (z. B. "pro Jahr" statt \
+"im Monat"), antworte mit dem, was im Dokument steht. Sage nicht "dazu steht nichts", nur weil die Einheit abweicht.
+6. Reicht der Kontext nicht aus, sage klar, dass du es in den Dokumenten nicht findest. Nenne, was du gefunden \
+hast, und stelle höchstens 1-2 Rückfragen.
+7. Antworte auf Deutsch, knapp und zuerst mit der konkreten Antwort (Zahl, Datum, Regel).
+8. Schreibe KEINEN Quellen-Abschnitt am Ende. Das System fügt die Quellen automatisch hinzu."""
 
 
-def _history(sid):
-    return SQLChatMessageHistory(session_id=sid, connection=engine)
+def _history(session_id: str) -> SQLiteChatHistory:
+    return SQLiteChatHistory(session_id, get_engine())
 
 
 def _format_docs(docs: list[Document]) -> str:
-    """Formatiert die gefundenen Dokumente für den Prompt."""
+    """Formatiert die gefundenen Textabschnitte für den Prompt."""
     if not docs:
         return "Keine relevanten Dokumente gefunden."
 
     formatted = []
     for d in docs:
         meta = d.metadata or {}
-        source = meta.get("source", "unbekannt")
-        dateityp = meta.get("Dateityp", None)
-        chunk_index = meta.get("chunk_index", None)
-
-        meta_parts = [f"Quelle: {source}"]
-        if dateityp:
-            meta_parts.append(f"Dateityp: {dateityp}")
-        if chunk_index is not None:
-            meta_parts.append(f"Chunk: {chunk_index}")
-
-        meta_str = " | ".join(meta_parts)
-        formatted.append(f"{meta_str}\n{d.page_content}")
+        parts = [f"Dokument: {meta.get('title') or meta.get('source', 'unbekannt')}"]
+        if meta.get("created"):
+            parts.append(f"Datum: {meta['created']}")
+        if meta.get("chunk_index") is not None:
+            parts.append(f"Abschnitt: {meta['chunk_index'] + 1}/{meta.get('chunk_count', '?')}")
+        formatted.append(" | ".join(parts) + f"\n{d.page_content}")
 
     return "\n\n---\n\n".join(formatted)
 
 
-def _dedupe_keep_order(items: list[str]) -> list[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x and x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
+def _format_sources(docs: list[Document]) -> list[str]:
+    """Eine Quelle pro Dokument (nicht pro Abschnitt), als Markdown-Link, falls eine URL bekannt ist."""
+    seen: set = set()
+    sources = []
+    for d in docs:
+        meta = d.metadata or {}
+        key = meta.get("doc_id", meta.get("source"))
+        title = meta.get("title") or meta.get("source")
+        if not title or key in seen:
+            continue
+        seen.add(key)
+        url = meta.get("url")
+        sources.append(f"[{title}]({url})" if url else title)
+    return sources
 
 
-def _append_sources(answer: str, sources: list[str]) -> str:
-    if not sources:
-        return answer
-
-    # Falls das Modell selbst schon einen Quellenblock generiert: entferne ihn
-    cleaned = re.sub(r"\n?Quellen:\s.*$", "", answer, flags=re.IGNORECASE | re.DOTALL).rstrip()
-    return cleaned + "\n\nQuellen: " + "; ".join(sources)
-
-def qwen_rerank(query: str, docs: list[Document], top_n: int = 3) -> list[Document]:
-    """Rerankt Docs mit Qwen3-Reranker über Ollama."""
-    reranker = OllamaLLM(
+@lru_cache(maxsize=1)
+def _get_reranker() -> OllamaLLM:
+    return OllamaLLM(
         base_url=settings.OLLAMA_BASE_URL,
         model=settings.OLLAMA_RERANK_MODEL,
-        temperature=0.0
+        temperature=0.0,
     )
-    scored_docs = []
 
-    for doc in docs:
-        prompt = f"""Bewerte die Relevanz dieses Dokuments zur Query (nur Score 0-10 als Zahl).
 
-    Query: {query}
-    Document: {doc.page_content[:1500]}
+def _parse_score(text: str) -> float:
+    """Liest die erste Zahl aus der Modellantwort, auch wenn Text drumherum steht. Ergebnis 0.0 bis 1.0."""
+    match = re.search(r"\d+(?:[.,]\d+)?", text)
+    if not match:
+        return 0.0
+    return min(max(float(match.group(0).replace(",", ".")), 0.0), 10.0) / 10.0
 
-    Relevanz-Score (0-10):"""
 
-        score_str = reranker.invoke(prompt).strip()
-        # Extrahiere die erste Zahl aus dem String, falls das Modell Text mitliefert
-        match = re.search(r"(\d+(\.\d+)?)", score_str)
-        try:
-            score = float(match.group(1)) / 10.0 if match else 0.0
-        except (ValueError, AttributeError):
-            score = 0.0
+def qwen_rerank(query: str, docs: list[Document], top_n: int) -> list[Document]:
+    """Sortiert die Treffer mit dem Reranker-Modell neu. Fällt bei Fehlern auf die Suchreihenfolge zurück."""
+    if not docs:
+        return []
+    if not settings.RERANK_ENABLED:
+        return docs[:top_n]
 
-        scored_docs.append((doc, score))
+    try:
+        reranker = _get_reranker()
+        scored = []
+        for doc in docs:
+            prompt = (
+                "Bewerte die Relevanz dieses Dokuments zur Query (nur Score 0-10 als Zahl).\n\n"
+                f"Query: {query}\n"
+                f"Document: {doc.page_content[:1500]}\n\n"
+                "Relevanz-Score (0-10):"
+            )
+            scored.append((doc, _parse_score(reranker.invoke(prompt))))
+    except Exception as e:
+        log.warning("Reranking fehlgeschlagen, nutze Suchreihenfolge: %s", e)
+        return docs[:top_n]
 
-    # Sortiere nach Score und nimm top_n
-    scored_docs.sort(key=lambda x: x[1], reverse=True)
-    return [doc for doc, _ in scored_docs[:top_n]]
+    scored.sort(key=lambda x: x[1], reverse=True)  # stabil: bei Gleichstand bleibt die Suchreihenfolge
+    return [doc for doc, _ in scored[:top_n]]
+
 
 def build_chain():
-    # Vektorstore initialisieren und Retriever erstellen
-    vector_store = get_vector_store()
-    retriever = vector_store.as_retriever(
+    retriever = get_vector_store().as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 8, "fetch_k": 20, "lambda_mult": 0.9}
+        search_kwargs={
+            "k": settings.RETRIEVER_K,
+            "fetch_k": max(settings.RETRIEVER_FETCH_K, settings.RETRIEVER_K),
+            "lambda_mult": 0.9,
+        },
     )
 
-    aktuelles_datum = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    system_instruction = f"""Du bist ein KI-Assistent für Mitarbeiter, dabei hast du Zugriff auf Dokumente aus dem SharePoint.
-    AKTUELLES DATUM: {aktuelles_datum} (Nutze dieses Datum für alle zeitbezogenen Antworten wie "heute" oder "dieses Jahr").
-    Datum nur angeben, wenn gefragt wird.
-    
-    DEINE OBERSTE PRIORITÄT: KORREKTHEIT VOR SCHNELLIGKEIT.
-
-    REGELN:
-    1. Nutze für fachliche Fragen NUR die vorhandenen Quellen.
-    2. ZEIT-EINHEITEN: Wenn der Nutzer nach einer Einheit fragt (z.B. "im Monat"), das Dokument aber eine andere nennt (z.B. "pro Woche" oder "pro Jahr"), dann antworte mit der Einheit aus dem Dokument. Sag nicht "dazu steht nichts", nur weil die Einheit abweicht.
-    3. FEHLERTOLERANZ: Ignoriere Scanner-Fehler in den Texten (z.B. wenn "8 4" statt "§ 4" steht oder "Diestwagen" statt "Dienstwagen"). Versuche den Sinn zu verstehen.
-    4. AUSNAHME: Wenn nach dem aktuellen Datum oder der Uhrzeit gefragt wird, nutze die Info "AKTUELLES DATUM" aus diesem Prompt, auch wenn es nicht in den Dokumenten steht.
-    5. Erfinde keine Quellen und erfinde keine Fakten.
-    6. Antworte mit dem, was sicher aus dem Kontext ableitbar ist, und stelle dann 1-2 Rückfragen für die fehlenden Infos.
-    7. Wenn du etwas nicht beantworten kannst, dann antworte mit ich "weiß es nicht".
-    
-    REGELN ZUR QUELLEN-PRIORISIERUNG:
-    1. THEMEN-CHECK: Prüfe zuerst, worum es geht.
-        - Geht es um **Personal/HR** (Gehalt, Urlaub, Studenten, Abschlussarbeit)? -> Nutze NUR Quellen wie "Information", "Betriebsvereinbarung" oder "Leitfaden".
-        - Geht es um **Prozesse/Einkauf** (Vergabe, Beschaffung)? -> Nutze "Direktiven" oder "Prozessanweisungen".
-
-    2. KONFLIKT-LÖSUNG: 
-        - Wenn ein Dokument "Vergabe" oder "Einkauf" heißt, gelten die Zahlen darin NICHT für Gehälter oder Studentenvergütungen.
-        - Beispiel: "Vergütung" in einer Vergabe-Richtlinie betrifft Firmen, nicht Studenten. Ignoriere diese Zahlen für Personalfragen.
-
-    3. ANTWORT-STRUKTUR:
-        - Nenne zuerst die konkrete Antwort (Zahl, Frist, Regel).
-        - Schreibe KEINEN Quellen-Abschnitt am Ende. Das System fügt die Quellen automatisch hinzu.
-    """
-
-    # Prompt mit Kontext + History
-    msgs = [
-        SystemMessagePromptTemplate.from_template(
-            system_instruction
-        ),
+    prompt = ChatPromptTemplate(messages=[
+        SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
         MessagesPlaceholder("history"),
         HumanMessagePromptTemplate.from_template(
-            "KONTEXT AUS DOKUMENTEN:\n{context}\n\n"
-            "NUTZER-FRAGE: {input}"
+            "KONTEXT AUS DOKUMENTEN:\n{context}\n\nNUTZER-FRAGE: {input}"
         ),
-    ]
+    ])
+    generation_chain = prompt | get_llm() | StrOutputParser()
 
-    prompt = ChatPromptTemplate(messages=msgs)
-
-    # Kontext aus Chroma holen und in das Input-Dict einfügen
     def add_context(inputs: dict) -> dict:
-        """
-        inputs kommt von RunnableWithMessageHistory und enthält:
-        - 'input': die Nutzerfrage (String)
-        - 'history': die bisherigen Chatnachrichten
-        Wir fügen 'context' hinzu, der aus dem Retriever kommt.
-        """
+        """Holt passende Textabschnitte aus Chroma und ergänzt Kontext, Quellen und Datum."""
         query = inputs["input"]
-
-        # Initiale Docs holen
         docs = retriever.invoke(query)
+        top = qwen_rerank(query, docs, top_n=settings.RERANK_TOP_N)
+        log.info("Frage: %r, %d Treffer, %d nach Reranking", query, len(docs), len(top))
+        return {
+            **inputs,
+            "context": _format_docs(top),
+            "sources": _format_sources(top),
+            # Zur Laufzeit statt beim Start: Die App läuft als Dienst tagelang durch.
+            "datum": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
 
-        # Rerank anwenden
-        reranked_docs = qwen_rerank(query, docs, top_n=4)
-
-        # Context formatieren
-        context = _format_docs(reranked_docs)
-
-        # Sources extrahieren
-        sources = []
-        for d in reranked_docs:
-            meta = d.metadata or {}
-            src = meta.get("source")
-            if src:
-                sources.append(src)
-        sources = _dedupe_keep_order(sources)
-
-        print(context)
-        print(inputs)
-        print(f"Reranked {len(reranked_docs)} Docs (von {len(docs)} initial)")
-        return {**inputs, "context": context, "sources": sources}
-
-    llm_generation_chain = (
-            prompt
-            | get_llm()
-            | StrOutputParser()
-    )
-
-    def stream_with_sources(input_dict: dict):
-        """
-        Diese Funktion streamt erst die LLM-Antwort und
-        hängt danach die Quellen an.
-        """
-        # LLM Antwort streamen
-        for chunk in llm_generation_chain.stream(input_dict):
-            yield chunk
-
-        # Quellen anhängen (als letzter Chunk)
-        sources = input_dict.get("sources", [])
-        if sources:
-            source_text = "\n\n**Quellen:** " + "; ".join(sources)
-            yield source_text
-
-    rag_chain = (
-            RunnableLambda(add_context)
-            | RunnableLambda(stream_with_sources)
-    )
+    def stream_with_sources(inputs: dict):
+        """Streamt die Antwort und hängt danach die Quellen an."""
+        yield from generation_chain.stream(inputs)
+        if inputs.get("sources"):
+            yield "\n\n**Quellen:** " + "; ".join(inputs["sources"])
 
     return RunnableWithMessageHistory(
-        rag_chain,
+        RunnableLambda(add_context) | RunnableLambda(stream_with_sources),
         _history,
         input_messages_key="input",
         history_messages_key="history",

@@ -10,7 +10,7 @@ Paperless-ngx ──(REST-API, nur lesend)──► sync ──► ChromaDB ◄�
 ```
 
 * **sync** gleicht Paperless alle `SYNC_INTERVAL_MIN` Minuten mit Chroma ab. Nur neue und geänderte Dokumente werden neu eingelesen, gelöschte werden entfernt. Verwendet wird der OCR-Text, den Paperless selbst liefert.
-* **app** sucht passende Textabschnitte (MMR), sortiert sie mit dem Reranker neu, übergibt sie an das Sprachmodell und hängt die verwendeten Dokumente als Links nach Paperless an die Antwort.
+* **app** sucht passende Textabschnitte (MMR), sortiert sie optional mit einem Reranker neu, übergibt sie an das Sprachmodell und hängt die verwendeten Dokumente als Links nach Paperless an die Antwort.
 * Jeder Textabschnitt trägt Titel, Absender, Dokumenttyp, Datum und Tags im Kopf. Dadurch findet die Suche auch Fragen wie „Stromrechnung 2025“.
 * Der Chatverlauf liegt in SQLite (Volume `app_data`). Das Modell bekommt davon nur die letzten `HISTORY_MAX_MESSAGES` Nachrichten, ohne die Quellenzeilen.
 * Das Embedding-Modell bekommt die Präfixe, auf die es trainiert ist (`search_query:` für Fragen, `search_document:` für Abschnitte). Die Abschnitte sind höchstens 1000 Zeichen lang, damit sie in die 512 Tokens von `nomic-embed-text` passen.
@@ -54,8 +54,8 @@ Die Oberfläche läuft danach auf Port **8501**. Der erste Abgleich startet auto
 | `OLLAMA_NUM_PARALLEL` | `1` | Gleichzeitige Anfragen an Ollama. Jede braucht ein eigenes Kontextfenster im RAM |
 | `HISTORY_MAX_MESSAGES` | `6` | So viele letzte Nachrichten bekommt das Modell als Gesprächskontext |
 | `EMBED_QUERY_PREFIX` / `EMBED_DOC_PREFIX` | passend zum Modell | Präfixe für das Embedding-Modell. Nur setzen, wenn du ein anderes Modell nimmst |
-| `RERANK_ENABLED` | `true` | `false` spart Zeit auf schwacher CPU |
-| `RERANK_TOP_N` / `RETRIEVER_K` / `RETRIEVER_FETCH_K` | `4` / `8` / `20` | Wie viele Abschnitte gesucht und verwendet werden |
+| `RERANK_ENABLED` | `false` | Reranking der Treffer, siehe Hinweis unten |
+| `RERANK_TOP_N` / `RETRIEVER_K` / `RETRIEVER_FETCH_K` | `5` / `8` / `20` | Wie viele Abschnitte gesucht und verwendet werden |
 | `CHROMA_HOST` / `CHROMA_PORT` / `CHROMA_COLLECTION` | `localhost` / `8000` / `paperless` | ChromaDB (im Compose-Stack automatisch gesetzt) |
 | `SQLITE_URL` | `sqlite:///chat_history.db` | Chatverlauf (im Compose-Stack automatisch gesetzt) |
 
@@ -78,5 +78,6 @@ Die Tests laufen ohne Ollama und ohne Chroma-Server (In-Memory-Chroma, nachgeste
 
 * **Platzbedarf:** Die Python-Pakete (vor allem ChromaDB und Streamlit) belegen rund 0,9 GB, das App-Image ist also etwa 1 GB groß (geschätzt, nicht gebaut). Dazu kommen das Chroma-Image und die Ollama-Modelle.
 * **Keine Anmeldung:** Die Oberfläche ist offen für jeden im Netz. Sie gibt Auskunft über *alle* Dokumente, die der Paperless-Benutzer sehen darf. Stelle sie nur im Heimnetz bereit oder setze eine Authentifizierung davor. ChromaDB ist bewusst nicht nach außen veröffentlicht.
+* **Reranker:** Mit Ollama 0.40.9 gemessen (2026-10-28): `dengcao/Qwen3-Reranker-0.6B:Q8_0` antwortet für einen passenden und einen unpassenden Abschnitt gleich, alle Token haben dieselbe Wahrscheinlichkeit (Logprob −11,93 = ln der Vokabelgröße). Das GGUF erzeugt unter Ollama also keine verwertbare Ausgabe, deshalb ist Reranking standardmäßig aus. Der Code folgt dem Format der Modellkarte und lässt sich mit einem funktionierenden Modell per `RERANK_ENABLED=true` einschalten. Im App-Log stehen dann die Scores (`Rerank-Scores:`).
 * **Quellen:** Angezeigt werden die Dokumente, aus denen der Kontext stammt, nicht zwingend nur die, die das Modell wörtlich verwendet hat.
 * **Qualität:** Mit `llama3.2:1b` sind Antworten schnell, aber bei komplexen Fragen ungenau. Ein größeres Modell verbessert das deutlich, braucht ohne GPU aber Geduld.

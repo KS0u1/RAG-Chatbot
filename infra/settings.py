@@ -71,8 +71,11 @@ class Settings:
     # --- Retrieval ---
     RETRIEVER_K = _int("RETRIEVER_K", 8)
     RETRIEVER_FETCH_K = _int("RETRIEVER_FETCH_K", 20)
-    RERANK_ENABLED = _bool("RERANK_ENABLED", True)
-    RERANK_TOP_N = _int("RERANK_TOP_N", 4)
+    # Standard aus: dengcao/Qwen3-Reranker-0.6B liefert unter Ollama 0.40.9 für jeden Abschnitt dieselbe
+    # Ausgabe (alle Token gleich wahrscheinlich), sortiert also nichts. Nur mit einem funktionierenden
+    # Reranker-Modell einschalten, siehe README.
+    RERANK_ENABLED = _bool("RERANK_ENABLED", False)
+    RERANK_TOP_N = _int("RERANK_TOP_N", 5)
     RERANK_TIMEOUT = _int("RERANK_TIMEOUT", 60)  # Sekunden pro Abschnitt
 
     def reasoning(self) -> bool | None:

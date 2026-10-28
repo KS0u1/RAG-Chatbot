@@ -1,6 +1,6 @@
 import streamlit as st
 
-from core.chains import build_chain
+from core.chains import build_chain, sources_line
 from infra.chroma_db import get_vector_store
 from infra.db import get_engine
 from infra.history import SQLiteChatHistory
@@ -41,7 +41,8 @@ if st.button("Neues Gespräch"):
 for message, created_at in history.timestamped_messages():
     role = "user" if message.type == "human" else "assistant"
     with st.chat_message(role, avatar=USER_AVATAR if role == "user" else ASSISTANT_AVATAR):
-        st.markdown(message.content)
+        # Quellen stehen getrennt von der Antwort (ältere Einträge haben sie noch im Text)
+        st.markdown(message.content + sources_line(message.additional_kwargs.get("sources", [])))
         st.caption(created_at.strftime("%H:%M:%S"))
 
 # Neue Frage
@@ -49,12 +50,7 @@ if question := st.chat_input("Ich höre :D"):
     with st.chat_message("user", avatar=USER_AVATAR):
         st.write(question)
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
-        st.write_stream(
-            chain.stream(
-                {"input": question},
-                config={"configurable": {"session_id": st.session_state.session_id}},
-            )
-        )
+        st.write_stream(chain.stream(question, st.session_state.session_id))
 
 # Sidebar: Paperless-Abgleich
 with st.sidebar:

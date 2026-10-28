@@ -11,4 +11,6 @@ def get_llm() -> ChatOllama:
         base_url=settings.OLLAMA_BASE_URL,
         model=settings.OLLAMA_MODEL,
         temperature=settings.OLLAMA_TEMPERATURE,
+        num_ctx=settings.OLLAMA_NUM_CTX,
+        reasoning=settings.reasoning(),
     )

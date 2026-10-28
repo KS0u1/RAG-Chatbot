@@ -1,9 +1,11 @@
 import logging
 import re
 from datetime import datetime
-from functools import lru_cache
+from typing import Callable, Iterator
 
+from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import (
     ChatPromptTemplate,
@@ -11,9 +13,6 @@ from langchain_core.prompts import (
     MessagesPlaceholder,
     SystemMessagePromptTemplate,
 )
-from langchain_core.runnables import RunnableLambda
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_ollama import OllamaLLM
 
 from infra.chroma_db import get_vector_store
 from infra.db import get_engine
@@ -21,6 +20,7 @@ from infra.history import SQLiteChatHistory
 from infra.settings import settings
 
 from .llm import get_llm
+from .rerank import rerank
 
 log = logging.getLogger(__name__)
 
@@ -84,50 +84,91 @@ def _format_sources(docs: list[Document]) -> list[str]:
     return sources
 
 
-@lru_cache(maxsize=1)
-def _get_reranker() -> OllamaLLM:
-    return OllamaLLM(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.OLLAMA_RERANK_MODEL,
-        temperature=0.0,
-    )
+# Ältere Versionen haben die Quellenzeile mit in die gespeicherte Antwort geschrieben.
+_SOURCES_RE = re.compile(r"\n*\*\*Quellen:\*\*.*\Z", re.DOTALL)
 
 
-def _parse_score(text: str) -> float:
-    """Liest die erste Zahl aus der Modellantwort, auch wenn Text drumherum steht. Ergebnis 0.0 bis 1.0."""
-    match = re.search(r"\d+(?:[.,]\d+)?", text)
-    if not match:
-        return 0.0
-    return min(max(float(match.group(0).replace(",", ".")), 0.0), 10.0) / 10.0
+def strip_sources(text: str) -> str:
+    return _SOURCES_RE.sub("", text).rstrip()
 
 
-def qwen_rerank(query: str, docs: list[Document], top_n: int) -> list[Document]:
-    """Sortiert die Treffer mit dem Reranker-Modell neu. Fällt bei Fehlern auf die Suchreihenfolge zurück."""
-    if not docs:
+def trim_history(messages: list[BaseMessage], max_messages: int) -> list[BaseMessage]:
+    """Die letzten `max_messages` Nachrichten für den Prompt, ohne Quellenzeilen und Zusatzdaten.
+
+    Das Modell bekommt so nur das Gespräch selbst. Sieht es frühere Quellenlinks, schreibt es sie
+    nach, und ein unbegrenzter Verlauf macht jede Antwort langsamer und sprengt irgendwann das
+    Kontextfenster.
+    """
+    if max_messages <= 0:
         return []
-    if not settings.RERANK_ENABLED:
-        return docs[:top_n]
-
-    try:
-        reranker = _get_reranker()
-        scored = []
-        for doc in docs:
-            prompt = (
-                "Bewerte die Relevanz dieses Dokuments zur Query (nur Score 0-10 als Zahl).\n\n"
-                f"Query: {query}\n"
-                f"Document: {doc.page_content[:1500]}\n\n"
-                "Relevanz-Score (0-10):"
-            )
-            scored.append((doc, _parse_score(reranker.invoke(prompt))))
-    except Exception as e:
-        log.warning("Reranking fehlgeschlagen, nutze Suchreihenfolge: %s", e)
-        return docs[:top_n]
-
-    scored.sort(key=lambda x: x[1], reverse=True)  # stabil: bei Gleichstand bleibt die Suchreihenfolge
-    return [doc for doc, _ in scored[:top_n]]
+    recent = messages[-max_messages:]
+    while recent and recent[0].type != "human":  # nicht mitten in einem Frage-Antwort-Paar beginnen
+        recent = recent[1:]
+    cleaned: list[BaseMessage] = []
+    for m in recent:
+        if m.type == "human":
+            cleaned.append(HumanMessage(m.content))
+        elif m.type == "ai":
+            cleaned.append(AIMessage(strip_sources(m.content)))
+    return cleaned
 
 
-def build_chain():
+def sources_line(sources: list[str]) -> str:
+    return "\n\n**Quellen:** " + "; ".join(sources) if sources else ""
+
+
+PROMPT = ChatPromptTemplate(messages=[
+    SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
+    MessagesPlaceholder("history"),
+    HumanMessagePromptTemplate.from_template("KONTEXT AUS DOKUMENTEN:\n{context}\n\nNUTZER-FRAGE: {input}"),
+])
+
+
+class ChatEngine:
+    """Suche, Reranking, Antwort und Verlauf.
+
+    Die Antwort wird gestreamt, danach folgt die Quellenzeile für die Anzeige. Im Verlauf
+    landet nur die Antwort, die Quellen stehen getrennt in `additional_kwargs["sources"]`.
+    """
+
+    def __init__(self, retriever, llm, history_factory: Callable[[str], BaseChatMessageHistory]):
+        self.retriever = retriever
+        self.generation_chain = PROMPT | llm | StrOutputParser()
+        self.history_factory = history_factory
+
+    def retrieve(self, question: str) -> list[Document]:
+        docs = self.retriever.invoke(question)
+        top = rerank(question, docs, top_n=settings.RERANK_TOP_N)
+        log.info("Frage: %r, %d Treffer, %d nach Reranking", question, len(docs), len(top))
+        return top
+
+    def stream(self, question: str, session_id: str) -> Iterator[str]:
+        history = self.history_factory(session_id)
+        past = trim_history(history.messages, settings.HISTORY_MAX_MESSAGES)
+        docs = self.retrieve(question)
+        sources = _format_sources(docs)
+
+        inputs = {
+            "input": question,
+            "history": past,
+            "context": _format_docs(docs),
+            # Zur Laufzeit statt beim Start: Die App läuft als Dienst tagelang durch.
+            "datum": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        parts: list[str] = []
+        for chunk in self.generation_chain.stream(inputs):
+            parts.append(chunk)
+            yield chunk
+
+        answer = "".join(parts).strip()
+        history.add_messages([
+            HumanMessage(question),
+            AIMessage(answer, additional_kwargs={"sources": sources}),
+        ])
+        yield sources_line(sources)
+
+
+def build_chain() -> ChatEngine:
     retriever = get_vector_store().as_retriever(
         search_type="mmr",
         search_kwargs={
@@ -136,39 +177,4 @@ def build_chain():
             "lambda_mult": 0.9,
         },
     )
-
-    prompt = ChatPromptTemplate(messages=[
-        SystemMessagePromptTemplate.from_template(SYSTEM_PROMPT),
-        MessagesPlaceholder("history"),
-        HumanMessagePromptTemplate.from_template(
-            "KONTEXT AUS DOKUMENTEN:\n{context}\n\nNUTZER-FRAGE: {input}"
-        ),
-    ])
-    generation_chain = prompt | get_llm() | StrOutputParser()
-
-    def add_context(inputs: dict) -> dict:
-        """Holt passende Textabschnitte aus Chroma und ergänzt Kontext, Quellen und Datum."""
-        query = inputs["input"]
-        docs = retriever.invoke(query)
-        top = qwen_rerank(query, docs, top_n=settings.RERANK_TOP_N)
-        log.info("Frage: %r, %d Treffer, %d nach Reranking", query, len(docs), len(top))
-        return {
-            **inputs,
-            "context": _format_docs(top),
-            "sources": _format_sources(top),
-            # Zur Laufzeit statt beim Start: Die App läuft als Dienst tagelang durch.
-            "datum": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-
-    def stream_with_sources(inputs: dict):
-        """Streamt die Antwort und hängt danach die Quellen an."""
-        yield from generation_chain.stream(inputs)
-        if inputs.get("sources"):
-            yield "\n\n**Quellen:** " + "; ".join(inputs["sources"])
-
-    return RunnableWithMessageHistory(
-        RunnableLambda(add_context) | RunnableLambda(stream_with_sources),
-        _history,
-        input_messages_key="input",
-        history_messages_key="history",
-    )
+    return ChatEngine(retriever, get_llm(), _history)

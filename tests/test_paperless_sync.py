@@ -165,6 +165,39 @@ def test_wechsel_des_embedding_modells_liest_alles_neu_ein(store, monkeypatch):
     assert result.updated == 2
 
 
+def test_neue_index_version_liest_alles_neu_ein(store, monkeypatch):
+    paperless = FakePaperless()
+    paperless.put(1, "Eins")
+    paperless.put(2, "Zwei")
+    sync_paperless(store, client=paperless)
+
+    monkeypatch.setattr("infra.paperless_sync.INDEX_VERSION", 99)
+    result = sync_paperless(store, client=paperless)
+
+    assert result.updated == 2
+
+
+def test_geaendertes_embedding_praefix_liest_alles_neu_ein(store, monkeypatch):
+    paperless = FakePaperless()
+    paperless.put(1, "Eins")
+    sync_paperless(store, client=paperless)
+
+    monkeypatch.setattr(settings, "EMBED_DOC_PREFIX", "passage: ")
+    result = sync_paperless(store, client=paperless)
+
+    assert result.updated == 1
+
+
+def test_chunks_bleiben_unter_dem_limit_des_embedding_modells():
+    names = {"tags": {}, "correspondents": {}, "document_types": {}}
+    doc = {"id": 1, "title": "Lang", "content": LONG_TEXT, "modified": "x"}
+
+    _, texts, _ = build_chunks(doc, names)
+
+    # nomic-embed-text: 512 Tokens. Grob 3 Zeichen pro Token ist für OCR-Text vorsichtig gerechnet.
+    assert max(len(t) for t in texts) <= 512 * 3 - 100
+
+
 def test_halb_geschriebenes_dokument_wird_repariert(store):
     paperless = FakePaperless()
     paperless.put(1, LONG_TEXT)

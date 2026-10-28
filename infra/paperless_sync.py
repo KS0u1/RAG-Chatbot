@@ -14,6 +14,7 @@ from typing import Callable
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from .chroma_db import embed_prefixes
 from .paperless import PaperlessClient, PaperlessError
 from .settings import settings
 
@@ -22,10 +23,16 @@ log = logging.getLogger(__name__)
 SOURCE_TYPE = "paperless"
 BATCH_SIZE = 64
 MAX_CONSECUTIVE_FAILURES = 3
+# Hochzählen, wenn sich ändert, wie Chunks gebaut oder eingebettet werden. Der Sync liest dann
+# beim nächsten Lauf alle Dokumente automatisch neu ein.
+# v2: Embedding-Präfixe (search_document/search_query) und kleinere Chunks
+INDEX_VERSION = 2
 
+# nomic-embed-text liest höchstens 512 Tokens, der Rest wird abgeschnitten. OCR-Text auf Deutsch hat
+# grob 3-4 Zeichen pro Token, 1000 Zeichen plus Kopfzeile bleiben sicher darunter.
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1500,
-    chunk_overlap=150,
+    chunk_size=1000,
+    chunk_overlap=100,
     separators=["\n\n", "\n", ". ", " ", ""],
 )
 
@@ -55,9 +62,11 @@ class SyncResult:
 
 
 def _sync_key(modified: str, embed_model: str) -> str:
-    # Wechselt das Embedding-Modell, passen alte Vektoren nicht mehr zu neuen Anfragen.
-    # Mit dem Modell im Schlüssel werden dann automatisch alle Dokumente neu eingelesen.
-    return f"{modified}|{embed_model}"
+    # Wechselt das Embedding-Modell oder die Art, wie Chunks gebaut werden, passen alte Vektoren
+    # nicht mehr zu neuen Anfragen. Mit Modell und Index-Version im Schlüssel werden dann
+    # automatisch alle Dokumente neu eingelesen.
+    _, doc_prefix = embed_prefixes(embed_model)
+    return f"{modified}|{embed_model}|{doc_prefix.strip()}|v{INDEX_VERSION}"
 
 
 def build_chunks(doc: dict, names: dict[str, dict[int, str]]) -> tuple[list[str], list[str], list[dict]]:

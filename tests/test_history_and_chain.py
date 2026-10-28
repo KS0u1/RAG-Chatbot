@@ -5,9 +5,8 @@ from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import create_engine
 
-from core.chains import _format_docs, _format_sources, _parse_score, qwen_rerank
+from core.chains import _format_docs, _format_sources
 from infra.history import SQLiteChatHistory
-from infra.settings import settings
 
 
 @pytest.fixture
@@ -47,13 +46,6 @@ def test_verlauf_ueberlebt_neustart(tmp_path):
     assert SQLiteChatHistory("x", create_engine(url)).messages[0].content == "bleibt"
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("8", 0.8), ("Score: 7.5", 0.75), ("7,5", 0.75), ("kein Score", 0.0), ("15", 1.0), ("", 0.0),
-])
-def test_reranker_score_wird_robust_gelesen(text, expected):
-    assert _parse_score(text) == pytest.approx(expected)
-
-
 def test_quellen_pro_dokument_nur_einmal_und_als_link():
     docs = [
         Document("a", metadata={"doc_id": 1, "title": "Stromrechnung", "url": "http://p/documents/1/details"}),
@@ -71,36 +63,3 @@ def test_kontext_enthaelt_titel_datum_und_abschnitt():
 
     assert "Dokument: Brief" in text and "Datum: 2026-01-02" in text and "Abschnitt: 1/3" in text
     assert _format_docs([]) == "Keine relevanten Dokumente gefunden."
-
-
-def test_rerank_aus_gibt_suchreihenfolge_zurueck(monkeypatch):
-    monkeypatch.setattr(settings, "RERANK_ENABLED", False)
-    docs = [Document(str(i)) for i in range(6)]
-
-    assert qwen_rerank("frage", docs, top_n=3) == docs[:3]
-
-
-def test_rerank_fehler_faellt_auf_suchreihenfolge_zurueck(monkeypatch):
-    class Kaputt:
-        def invoke(self, prompt):
-            raise ConnectionError("Ollama weg")
-
-    monkeypatch.setattr(settings, "RERANK_ENABLED", True)
-    monkeypatch.setattr("core.chains._get_reranker", lambda: Kaputt())
-    docs = [Document(str(i)) for i in range(6)]
-
-    assert qwen_rerank("frage", docs, top_n=2) == docs[:2]
-
-
-def test_rerank_sortiert_nach_score(monkeypatch):
-    scores = iter(["2", "9", "5"])
-
-    class Fake:
-        def invoke(self, prompt):
-            return next(scores)
-
-    monkeypatch.setattr(settings, "RERANK_ENABLED", True)
-    monkeypatch.setattr("core.chains._get_reranker", lambda: Fake())
-    docs = [Document("a"), Document("b"), Document("c")]
-
-    assert [d.page_content for d in qwen_rerank("frage", docs, top_n=2)] == ["b", "c"]

@@ -5,6 +5,7 @@ from functools import lru_cache
 
 import chromadb
 from langchain_chroma import Chroma
+from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
 
 from .settings import settings
@@ -26,10 +27,45 @@ def get_client():
     return client
 
 
-def get_embeddings() -> OllamaEmbeddings:
-    return OllamaEmbeddings(
-        base_url=settings.OLLAMA_BASE_URL,
-        model=settings.OLLAMA_EMBED_MODEL,
+class PrefixedEmbeddings(Embeddings):
+    """Setzt vor Fragen und Dokumente das Präfix, das das Embedding-Modell erwartet.
+
+    nomic-embed-text ist darauf trainiert, "search_query: " vor Suchanfragen und
+    "search_document: " vor Dokumenten zu sehen. Ohne Präfix liegen Frage und passende
+    Abschnitte im Vektorraum weiter auseinander. In Chroma landet nur der Text ohne Präfix.
+    """
+
+    def __init__(self, inner: Embeddings, query_prefix: str = "", doc_prefix: str = ""):
+        self.inner = inner
+        self.query_prefix = query_prefix
+        self.doc_prefix = doc_prefix
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.inner.embed_documents([self.doc_prefix + t for t in texts])
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.inner.embed_query(self.query_prefix + text)
+
+
+def embed_prefixes(model: str) -> tuple[str, str]:
+    """(Frage-Präfix, Dokument-Präfix). Gesetzte Umgebungsvariablen haben Vorrang, auch leere."""
+    if "nomic-embed" in model.lower():
+        query, doc = "search_query: ", "search_document: "
+    else:
+        query, doc = "", ""
+    if settings.EMBED_QUERY_PREFIX is not None:
+        query = settings.EMBED_QUERY_PREFIX
+    if settings.EMBED_DOC_PREFIX is not None:
+        doc = settings.EMBED_DOC_PREFIX
+    return query, doc
+
+
+def get_embeddings() -> Embeddings:
+    query_prefix, doc_prefix = embed_prefixes(settings.OLLAMA_EMBED_MODEL)
+    return PrefixedEmbeddings(
+        OllamaEmbeddings(base_url=settings.OLLAMA_BASE_URL, model=settings.OLLAMA_EMBED_MODEL),
+        query_prefix=query_prefix,
+        doc_prefix=doc_prefix,
     )
 
 
